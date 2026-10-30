@@ -16,9 +16,14 @@ Head (body) frame: FLU (x forward, y left, z up).
 import argparse
 import json
 import math
+import multiprocessing as mp
 import os
 import pickle
 import sys
+
+# One BLAS thread per process, so the worker pool doesn't oversubscribe the CPUs
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -98,32 +103,37 @@ def to_htm(rot, pos):
 
 ### 1. Trajectories
 
-def load_segments(dataset_dir):
+def load_scene(dataset_dir, scene):
     b, a = butter(4, SMOOTH_CUTOFF_HZ / (FS_POSE / 2.0))
     segments = []
-    for scene in sorted(os.listdir(dataset_dir)):
-        with open(os.path.join(dataset_dir, scene), "rb") as f:
-            episodes = pickle.load(f)
-        for ep_idx, ep in enumerate(episodes):
-            for person in ("p1", "p2"):
-                head = ep[person]["head"]
-                if len(head["pos"]) < MIN_SEGMENT_S * FS_POSE:
-                    continue
-                floor = min(ep[person][foot]["pos"][:, 2].min() for foot in FEET)
-                pos = head["pos"] - np.array([0.0, 0.0, floor])
+    with open(os.path.join(dataset_dir, scene), "rb") as f:
+        episodes = pickle.load(f)
+    for ep_idx, ep in enumerate(episodes):
+        for person in ("p1", "p2"):
+            head = ep[person]["head"]
+            if len(head["pos"]) < MIN_SEGMENT_S * FS_POSE:
+                continue
+            floor = min(ep[person][foot]["pos"][:, 2].min() for foot in FEET)
+            pos = head["pos"] - np.array([0.0, 0.0, floor])
 
-                R_unity = Rotation.from_quat(head["pose"]).as_matrix()
-                rot = Rotation.from_matrix(M_UNITY_TO_WORLD @ R_unity @ M_UNITY_TO_WORLD.T) * R_TO_FLU
+            R_unity = Rotation.from_quat(head["pose"]).as_matrix()
+            rot = Rotation.from_matrix(M_UNITY_TO_WORLD @ R_unity @ M_UNITY_TO_WORLD.T) * R_TO_FLU
 
-                q = rot.as_quat()
-                flip = np.cumprod(np.r_[1.0, np.sign(np.sum(q[1:] * q[:-1], axis=1))])
-                q = filtfilt(b, a, q * flip[:, None], axis=0)
-                segments.append({
-                    "pos": filtfilt(b, a, pos, axis=0),
-                    "rot": Rotation.from_quat(q / np.linalg.norm(q, axis=1, keepdims=True)),
-                    "src": {"scene": scene, "episode": ep_idx, "person": person},
-                })
+            q = rot.as_quat()
+            flip = np.cumprod(np.r_[1.0, np.sign(np.sum(q[1:] * q[:-1], axis=1))])
+            q = filtfilt(b, a, q * flip[:, None], axis=0)
+            segments.append({
+                "pos": filtfilt(b, a, pos, axis=0),
+                "rot": Rotation.from_quat(q / np.linalg.norm(q, axis=1, keepdims=True)),
+                "src": {"scene": scene, "episode": ep_idx, "person": person},
+            })
     return segments
+
+
+def load_segments(pool, dataset_dir):
+    # One scene file per task; starmap keeps the scene order, so segment indices match a serial load
+    scenes = sorted(os.listdir(dataset_dir))
+    return [seg for segs in pool.starmap(load_scene, [(dataset_dir, s) for s in scenes]) for seg in segs]
 
 
 def is_valid(xy, start, room, others):
@@ -153,9 +163,10 @@ def place_first(rng, seg, room, others):
 def continue_from(seg, end_pos, end_rot, end_step, delta):
     """
     Attach seg to the tail (end_pos, end_rot) so its heading continues the previous one, then ramp in an
-    extra yaw `delta` (|delta| <= MAX_STITCH_YAW_DEG) over at least BLEND_S and no faster than MAX_TURN_DEG
-    per MAX_TURN_POSES. Velocity, tilt and height are blended from the previous tail over BLEND_S.
-    Returns the new poses, excluding the shared junction pose.
+    extra yaw `delta` over at least BLEND_S and no faster than MAX_TURN_DEG per MAX_TURN_POSES. Velocity, tilt
+    and height are blended from the previous tail over BLEND_S.
+    Returns the new positions, excluding the shared junction pose, and a function that computes the matching
+    rotations. Most candidates fail is_valid on position alone, so rotations are only computed for the one kept.
     """
     pos, rot = seg["pos"], seg["rot"]
     k = np.arange(len(pos))
@@ -173,13 +184,15 @@ def continue_from(seg, end_pos, end_rot, end_step, delta):
     xy = end_pos[:2] + np.cumsum(steps, axis=0)
     z = pos[1:, 2] + (end_pos[2] - pos[0, 2]) * w[1:]
 
-    rot = Rotation.from_euler("z", phi) * rot
-    tilt = (end_rot * rot[0].inv()).as_rotvec()
-    rot = Rotation.from_rotvec(w[:, None] * tilt) * rot
-    return np.c_[xy, z], rot[1:]
+    def rotations():
+        r = Rotation.from_euler("z", phi) * rot
+        tilt = (end_rot * r[0].inv()).as_rotvec()
+        r = Rotation.from_rotvec(w[:, None] * tilt) * r
+        return r[1:]
+    return np.c_[xy, z], rotations
 
 
-def build_user(rng, segments, room, others, n_poses):
+def build_user(rng, segments, room, others, n_poses, random_yaw=False):
     # Prefer the smallest extra yaw that keeps the user valid
     deltas = [0.0]
     for mag in np.arange(DELTA_STEP_DEG, MAX_STITCH_YAW_DEG + 1e-9, DELTA_STEP_DEG):
@@ -194,18 +207,24 @@ def build_user(rng, segments, room, others, n_poses):
             break
     else:
         return None
-    positions, rotations = [placed[0]], [placed[1]]
+    positions, rotation_list = [placed[0]], [placed[1]]
     sources = [dict(seg["src"], t_start=0.0, delta_deg=None)]
     n = len(placed[0])
 
     while n < n_poses:
-        end_pos, end_rot = positions[-1][-1], rotations[-1][-1]
+        end_pos, end_rot = positions[-1][-1], rotation_list[-1][-1]
         end_step = (positions[-1][-1] - positions[-1][-2])[:2]
         for _ in range(SEGMENT_TRIES):
             seg = segments[rng.integers(len(segments))]
+            # Only the first n_poses - n poses after the junction are kept, and continue_from is causal,
+            # so transforming just that prefix gives the same poses as transforming the whole segment
+            keep = n_poses - n + 1
+            seg = dict(seg, pos=seg["pos"][:keep], rot=seg["rot"][:keep])
+            if random_yaw:
+                # Any heading at the stitch, tried in random order
+                deltas = rng.permutation(np.deg2rad(np.arange(-180.0, 180.0, DELTA_STEP_DEG)))
             for delta in deltas:
-                pos, rot = continue_from(seg, end_pos, end_rot, end_step, delta)
-                pos, rot = pos[:n_poses - n], rot[:n_poses - n]
+                pos, rotations = continue_from(seg, end_pos, end_rot, end_step, delta)
                 if is_valid(pos[:, :2], n, room, others):
                     break
             else:
@@ -214,20 +233,20 @@ def build_user(rng, segments, room, others, n_poses):
         else:
             return None
         positions.append(pos)
-        rotations.append(rot)
+        rotation_list.append(rotations())
         sources.append(dict(seg["src"], t_start=n / FS_POSE, delta_deg=float(np.rad2deg(delta))))
         n += len(pos)
 
-    return np.concatenate(positions), Rotation.concatenate(rotations), sources
+    return np.concatenate(positions), Rotation.concatenate(rotation_list), sources
 
 
-def generate_trajectories(rng, segments, n_mobile, room, duration):
+def generate_trajectories(rng, segments, n_mobile, room, duration, random_yaw=False):
     n_poses = int(round(duration * FS_POSE)) + 1
     users = []
     for uid in range(n_mobile):
         others = [u["pos"] for u in users]
         for _ in range(USER_TRIES):
-            built = build_user(rng, segments, room, others, n_poses)
+            built = build_user(rng, segments, room, others, n_poses, random_yaw)
             if built is not None:
                 break
         else:
@@ -286,7 +305,10 @@ def synthesize_imu(rng, user, imu):
     n = len(t_imu)
     accel = pathgen.acc_gen(IMU_FS, f_b, imu.accel_err) + random_walk(rng, per_axis(ACC_WALK), n, IMU_FS)
     gyro = pathgen.gyro_gen(IMU_FS, w_b, imu.gyro_err) + random_walk(rng, per_axis(GYRO_WALK), n, IMU_FS)
+    return t_imu, accel, gyro
 
+
+def imu_json(t_imu, accel, gyro):
     return [{
         "t": float(ti), "type": "imu",
         "ax": float(a[0]), "ay": float(a[1]), "az": float(a[2]),
@@ -357,17 +379,27 @@ def vive_json(user):
             for t, T in zip(user["t"][::step], T_world_to_head)]
 
 
+def write_user(user_dir, user, imu_streams, uwb):
+    os.makedirs(user_dir, exist_ok=True)
+    write_json(os.path.join(user_dir, "vive_synth.json"), vive_json(user))
+    write_json(os.path.join(user_dir, "imu_synth.json"), imu_json(*imu_streams))
+    write_json(os.path.join(user_dir, "uwb_synth.json"), uwb)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("N_mobile", type=int, help="number of mobile user trajectories")
     parser.add_argument("N_static", type=int, help="number of static anchors")
     parser.add_argument("--room_dim", type=float, nargs=2, default=[20.0, 20.0], metavar=("W", "H"))
     parser.add_argument("--duration", type=float, default=70.0, help="length of each user trajectory, s")
-    parser.add_argument("--uwb_rate", type=float, default=6, help="ranging attempts per node per second")
-    parser.add_argument("--uwb_airtime", type=float, default=0.002, help="duration of one ranging exchange, s")
+    parser.add_argument("--uwb_rate", type=float, default=10, help="ranging attempts per node per second")
+    parser.add_argument("--uwb_airtime", type=float, default=0.005, help="duration of one ranging exchange, s")
     parser.add_argument("--dataset", default=LOCOVR_PATH)
     parser.add_argument("--out_root", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--random", action="store_true",
+                        help="stitch each segment at a uniformly random heading instead of continuing the previous one")
+    parser.add_argument("--workers", type=int, default=8, help="processes for loading LocoVR and writing output")
     args = parser.parse_args()
     if args.N_mobile < 1 or args.N_static < 0:
         parser.error("need N_mobile >= 1 and N_static >= 0")
@@ -376,10 +408,14 @@ def main():
     np.random.seed(args.seed)  # gnss-ins-sim draws from the global numpy RNG
     room = tuple(args.room_dim)
 
-    segments = load_segments(args.dataset)
+    # Only deterministic work goes to the pool; everything that draws random numbers stays in this process,
+    # in the original order, so the output is identical to a serial run
+    pool = mp.get_context("fork").Pool(args.workers)
+
+    segments = load_segments(pool, args.dataset)
     print(f"Loaded {len(segments)} LocoVR head segments")
 
-    users = generate_trajectories(rng, segments, args.N_mobile, room, args.duration)
+    users = generate_trajectories(rng, segments, args.N_mobile, room, args.duration, args.random)
     anchors = generate_anchors(rng, args.N_mobile, args.N_static, room)
     imu = make_imu()
     uwb = synthesize_uwb(rng, users, anchors, users[0]["t"][-1], args.uwb_rate, args.uwb_airtime)
@@ -388,19 +424,18 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     write_json(os.path.join(out_dir, "anchors.json"), anchors)
     write_json(os.path.join(out_dir, "config.json"), {
-        "args": vars(args),
+        "args": {k: v for k, v in vars(args).items() if k != "workers"},  # workers doesn't affect the data
         "imu": {"frequency": IMU_FS, "noise_gyro": NOISE_GYRO, "noise_acc": NOISE_ACC,
                 "gyro_walk": GYRO_WALK, "acc_walk": ACC_WALK},
         "uwb_std": UWB_STD,
         "user_radius": USER_RADIUS,
         "sources": {u["id"]: u["sources"] for u in users},
     })
-    for u in users:
-        user_dir = os.path.join(out_dir, str(u["id"]))
-        os.makedirs(user_dir, exist_ok=True)
-        write_json(os.path.join(user_dir, "vive_synth.json"), vive_json(u))
-        write_json(os.path.join(user_dir, "imu_synth.json"), synthesize_imu(rng, u, imu))
-        write_json(os.path.join(user_dir, "uwb_synth.json"), uwb[u["id"]])
+    imu_streams = [synthesize_imu(rng, u, imu) for u in users]
+    pool.starmap(write_user, [(os.path.join(out_dir, str(u["id"])), u, streams, uwb[u["id"]])
+                              for u, streams in zip(users, imu_streams)])
+    pool.close()
+    pool.join()
     print(f"Wrote {out_dir}")
 
 

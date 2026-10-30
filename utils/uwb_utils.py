@@ -480,23 +480,18 @@ def range_synthesizer4( multi_all, anchors, gt_trajectories, T, std):
 
 def embed_poses_in_ranges( multi_all, anchors, gt_trajectories, mobile_nodes=[2,3,4]):
 
-    # For each range, find the closest SLAM pose, and embed that into the range.
-    for i in range(len(multi_all)):
+    # All aligned slam poses from each device, gathered once rather than once per range
+    slam_poses = {}
+    for m in multi_all:
+        if m["type"] == "aligned_slam_pose": slam_poses.setdefault(m["src"], []).append(m)
+    slam_ts = {src: np.array([m["t"] for m in poses]) for src, poses in slam_poses.items()} # Reduce to timestamps
 
-        mes = multi_all[i]
-        
+    # For each range, find the closest SLAM pose, and embed that into the range.
+    for mes in multi_all:
         if mes["type"] == "uwb":
             this_id = mes["src"]
             if this_id in mobile_nodes:
-                # print(this_id)
-                this_t = mes["t"]
-                # All aligned slam poses from this device
-                slam_poses = [m for m in multi_all if m["src"]==this_id and m["type"] == "aligned_slam_pose"]
-                # print(slam_poses)
-                slam_ts = [m["t"] for m in slam_poses] # Reduce to timestamps
-                # print(slam_ts)
-                idx = np.argmin(np.abs(np.array(slam_ts) - this_t)) # Get the closest slam pose timestamp to this UWB measurement
-                multi_all[i]["embedded_slam_pose"] = slam_poses[idx] # Embed it into the range.
-                # print(multi_all[i])
-    
+                idx = np.argmin(np.abs(slam_ts[this_id] - mes["t"])) # Get the closest slam pose timestamp to this UWB measurement
+                mes["embedded_slam_pose"] = slam_poses[this_id][idx] # Embed it into the range.
+
     return multi_all

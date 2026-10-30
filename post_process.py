@@ -4,6 +4,10 @@ import pkgutil
 import importlib
 import inspect
 import os
+# One BLAS thread per process, so the worker pools don't oversubscribe the CPUs
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+import multiprocessing as mp
 import json
 import csv
 import yaml
@@ -257,6 +261,41 @@ def load_synthetic_anchors(dataset_path):
 
 def synthetic_user_ids(dataset_path):
     return sorted(int(d) for d in os.listdir(dataset_path) if d.isdigit())
+
+### Parallel helpers
+
+def reseed_worker():
+    # Forked workers inherit the parent's np.random state; reseed so unseeded draws (perturb) stay
+    # independent across users, as they are when users run one after another
+    np.random.seed()
+
+def post_process_user(args, user):
+    args = copy.copy(args)
+    args.id = user
+    return post_process(args)
+
+_DUMP_DATA = None
+
+def _dump_chunk(lo, hi):
+    # The elements of json.dumps(list, indent=1), without the enclosing "[\n" and "\n]"
+    return json.dumps(_DUMP_DATA[lo:hi], cls=NumpyEncoder, indent=1)[2:-2]
+
+def dump_json_parallel(data, path, workers):
+    # Byte-identical to json.dump(data, f, cls=NumpyEncoder, indent=1), but the list is encoded in chunks across
+    # processes. Forking after setting _DUMP_DATA hands the list to the workers without pickling it.
+    global _DUMP_DATA
+    if len(data) == 0:
+        with open(path, 'w') as f: json.dump(data, f, cls=NumpyEncoder, indent=1)
+        return
+    _DUMP_DATA = data
+    bounds = np.linspace(0, len(data), min(len(data), 4 * workers) + 1).astype(int)
+    with mp.get_context("fork").Pool(workers) as pool:
+        chunks = pool.starmap(_dump_chunk, zip(bounds[:-1], bounds[1:]))
+    _DUMP_DATA = None
+    with open(path, 'w') as f:
+        f.write("[\n")
+        f.write(",\n".join(chunks))
+        f.write("\n]")
 
 def post_process(args):
 
@@ -702,6 +741,8 @@ if __name__ == "__main__":
     parser.add_argument("--perturb_r", type=float)
     # Directory containing the generate.py datasets
     parser.add_argument("--generated_dir", default=f"{ROOT}/generated")
+    # Processes for per-user post processing and for writing the merged all.json
+    parser.add_argument("--workers", type=int, default=8)
 
     args = parser.parse_args()
 
@@ -714,11 +755,12 @@ if __name__ == "__main__":
         gt_trajectories = {}
         users = synthetic_user_ids(f"{args.generated_dir}/{args.trial_name}")
 
-        for user in users:
-            print(f"\nUSER{user}\n")
+        # Users are independent, so process them in parallel, then merge in user order
+        with mp.get_context("fork").Pool(args.workers, initializer=reseed_worker) as pool:
+            results = pool.starmap(post_process_user, [(args, user) for user in users])
 
+        for user, (all, anchor_positions, T, body_opti_tum_traj) in zip(users, results):
             args.id = user # Override whatever ID gets passed in
-            all, anchor_positions, T, body_opti_tum_traj = post_process(args)
             merged_all = merged_all + all
             gt_trajectories[user] = body_opti_tum_traj
             # Record anchors once
@@ -791,7 +833,7 @@ if __name__ == "__main__":
                 if u["type"] == "uwb" and u["id"] == 5: u["range"] -= 0.17
 
         merged_all = sorted(merged_all, key=lambda x: x["t"])
-        json.dump(merged_all, open(outpath+"/all.json", 'w'), cls=NumpyEncoder, indent=1)
+        dump_json_parallel(merged_all, outpath+"/all.json", args.workers)
 
         # UWB error analysis
         if args.check_uwb_error:
